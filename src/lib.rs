@@ -1,90 +1,34 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-
 //! This crate implements a minimal abstraction over UNIX domain sockets for
 //! the purpose of IPC.  It lets you send both file handles and rust objects
 //! between processes.
 //!
-//! # How it works
-//!
-//! This uses [serde](https://serde.rs/) to serialize data over unix sockets
-//! via [bincode](https://github.com/servo/bincode).  Thanks to the
-//! [`Handle`](struct.Handle.html) abstraction you can also send any object
-//! across that is convertable into a unix file handle.
-//!
-//! The way this works under the hood is that during serialization and
-//! deserialization encountered file descriptors are tracked.  They are then
-//! sent over the unix socket separately.  This lets unassociated processes
-//! share file handles.
-//!
-//! If you only want the unix socket abstraction you can disable all default
-//! features and use the raw channels.
-//!
-//! # Example
-//!
-//! ```rust
-//! # use ::serde;
-//! use std::env;
-//! use std::process;
-//! use unix_ipc::{channel, Bootstrapper, Receiver, Sender};
-//! use serde::{Deserialize, Serialize};
-//!
-//! const ENV_VAR: &str = "PROC_CONNECT_TO";
-//!
-//! #[derive(Serialize, Deserialize, Debug)]
-//! # #[serde(crate = "serde_")]
-//! pub enum Task {
-//!     Sum(Vec<i64>, Sender<i64>),
-//!     Shutdown,
-//! }
-//!
-//! if let Ok(path) = env::var(ENV_VAR) {
-//!     let receiver = Receiver::<Task>::connect(path).unwrap();
-//!     loop {
-//!         match receiver.recv().unwrap() {
-//!             Task::Sum(values, tx) => {
-//!                 tx.send(values.into_iter().sum::<i64>()).unwrap();
-//!             }
-//!             Task::Shutdown => break,
-//!         }
+//! ```
+//! fn main() {
+//!     match companion::bootstrap() {
+//!         Ok(val) => println!("launched"),
+//!         Err(_) => println!("already launched"),
 //!     }
-//! } else {
-//!     let bootstrapper = Bootstrapper::new().unwrap();
-//!     let mut child = process::Command::new(env::current_exe().unwrap())
-//!         .env(ENV_VAR, bootstrapper.path())
-//!         .spawn()
-//!         .unwrap();
-//!
-//!     let (tx, rx) = channel().unwrap();
-//!     bootstrapper.send(Task::Sum(vec![23, 42], tx)).unwrap();
-//!     println!("sum: {}", rx.recv().unwrap());
-//!     bootstrapper.send(Task::Shutdown).unwrap();
 //! }
 //! ```
-//!
-//! # Feature Flags
-//!
-//! All features are enabled by default but a lot can be turned off to
-//! cut down on dependencies.  With all default features enabled only
-//! the raw types are available.
-//!
-//! * `serde`: enables serialization and deserialization.
-//! * `bootstrap`: adds the `Bootstrapper` type.
-//! * `bootstrap-simple`: adds the default `new` constructor to the
-//!   bootstrapper.
-
 use std::{
-    env,
-    error::Error,
-    fmt,
+    collections::HashMap,
+    env, fs,
+    os::unix::{
+        io::{FromRawFd, IntoRawFd},
+        net::UnixListener,
+    },
     path::{Path, PathBuf},
-    process,
-    result::Result,
+    process::Stdio,
+    time::Duration,
 };
 
-use bytes::Bytes;
+use sysinfo::{Pid, PidExt, SystemExt};
+
+#[cfg(feature = "log")]
+use log::*;
+#[cfg(feature = "log")]
+use syslog::{BasicLogger, Facility, Formatter3164};
+
 use serde::{Deserialize, Serialize};
 
 mod raw_channel;
@@ -96,13 +40,31 @@ pub use self::serialize::*;
 mod typed_channel;
 pub use self::typed_channel::*;
 
-pub const ENV_VAR: &str = "RUST_COMPANION";
-pub const PROGRAM_NAME: &str = "rust-companion";
+pub(crate) const ENV_VAR: &str = "RUST_COMPANION";
+pub(crate) const PROGRAM_NAME: &str = "rust-companion";
+
+#[cfg(feature = "log")]
+fn setup_logger() {
+    use companion::PROGRAM_NAME;
+
+    let formatter = Formatter3164 {
+        facility: Facility::LOG_USER,
+        hostname: None,
+        process: PROGRAM_NAME.into(),
+        pid: 0,
+    };
+
+    let logger = syslog::unix(formatter).expect("could not connect to syslog");
+    log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
+        .map(|()| log::set_max_level(LevelFilter::Info))
+        .expect("could not register logger");
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
     String(String),
-    Binary(Bytes), // Or Vec<u8>
+    List(Vec<String>),
+    Ok,
     NotFound,
 }
 
@@ -112,21 +74,13 @@ pub enum Task {
     Get(String, Sender<Response>),
     // Store data by name
     Set(String, String, Sender<Response>),
+    // List stored names
+    List(Sender<Response>),
     Sum(Vec<i64>, Sender<Response>),
     Shutdown,
 }
 
-pub fn ensure_companion(path: &Path) -> Result<bool, Box<dyn Error>> {
-    if !path.exists() {
-        which::which("rust-companion")?;
-
-        let child = std::process::Command::new(PROGRAM_NAME).spawn()?;
-        println!("child pid: {}", child.id());
-    }
-    Ok(true)
-}
-
-pub fn get_path() -> PathBuf {
+pub fn socket_path() -> PathBuf {
     if let Ok(path) = env::var(ENV_VAR) {
         path.into()
     } else {
@@ -134,4 +88,143 @@ pub fn get_path() -> PathBuf {
         dir.push(&format!("{}.sock", PROGRAM_NAME));
         dir
     }
+}
+
+pub fn pid_path() -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(&format!("{}.pid", PROGRAM_NAME));
+    dir
+}
+
+fn check_started<P>(path: P) -> bool
+where
+    P: AsRef<Path>,
+{
+    match fs::read_to_string(&path) {
+        Ok(pids) => {
+            // println!("pids: {pids}");
+            let sys = sysinfo::System::new_all();
+            let processes = sys.processes();
+            let pids: Vec<u32> = pids.lines().filter_map(|s| s.parse::<u32>().ok()).collect();
+            let mut started = false;
+            let mut new_pids = vec![];
+            for pid in pids.iter() {
+                if processes.contains_key(&Pid::from_u32(*pid)) {
+                    started = true;
+                    new_pids.push(*pid);
+                }
+            }
+
+            if started {
+                let contents = new_pids
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<String>>()
+                    .join("\n");
+
+                fs::write(&path, contents).unwrap();
+                return true;
+            }
+        }
+        Err(_) => {}
+    }
+    false
+}
+
+fn launch<P>(path: P)
+where
+    P: AsRef<Path>,
+{
+    #[cfg(feature = "log")]
+    setup_logger();
+
+    let pid = std::process::id();
+
+    fs::write(path, pid.to_string()).unwrap();
+
+    let socket_path = socket_path();
+
+    let mut storage: HashMap<String, String> = HashMap::new();
+
+    // println!("{:?}", socket_path);
+
+    fs::remove_file(&socket_path).ok();
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    'outer: loop {
+        let (sock, _) = listener.accept().unwrap();
+        let receiver: Receiver<Task> =
+            unsafe { RawReceiver::from_raw_fd(sock.into_raw_fd()).into() };
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        loop {
+            let task = match receiver.recv() {
+                Ok(task) => task,
+                Err(_) => {
+                    // break to wait a new connection
+                    break;
+                }
+            };
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            match task {
+                Task::Get(key, tx) => {
+                    #[cfg(feature = "log")]
+                    log::info!("get {}", key);
+                    match storage.get(&key) {
+                        Some(data) => tx.send(Response::String(data.clone())).unwrap(),
+                        None => tx.send(Response::NotFound).unwrap(),
+                    }
+                }
+                Task::Set(key, data, tx) => {
+                    #[cfg(feature = "log")]
+                    log::info!("set {}", key);
+                    storage.insert(key, data);
+                    tx.send(Response::Ok).unwrap();
+                }
+                Task::List(tx) => {
+                    let keys: Vec<String> = storage.keys().map(Clone::clone).collect();
+                    tx.send(Response::List(keys)).unwrap();
+                }
+                Task::Sum(_values, tx) => {
+                    #[cfg(feature = "log")]
+                    log::info!("shutdown");
+                    tx.send(Response::NotFound).unwrap();
+                }
+                Task::Shutdown => {
+                    #[cfg(feature = "log")]
+                    log::info!("shutdown");
+                    break 'outer;
+                }
+            }
+        }
+    }
+    fs::remove_file(&socket_path).ok();
+}
+
+pub fn bootstrap() -> std::result::Result<bool, Box<dyn std::error::Error>> {
+    let pid_path = pid_path();
+
+    if !check_started(&pid_path) {
+        match env::args().nth(1) {
+            Some(arg) => {
+                if arg == "-d" {
+                    launch(&pid_path);
+                }
+            }
+            None => {
+                match env::current_exe() {
+                    Ok(exe_path) => {
+                        let _child = std::process::Command::new(&exe_path)
+                            .arg("-d")
+                            .stderr(Stdio::null())
+                            .stdout(Stdio::null())
+                            .spawn()?;
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                    Err(e) => println!("failed to get current exe path: {e}"),
+                };
+            }
+        }
+    }
+
+    Ok(true)
 }

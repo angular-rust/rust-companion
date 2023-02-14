@@ -1,28 +1,43 @@
 #![allow(unused_imports)]
+use std::{fs, time::Duration};
+
 use serde::{Deserialize, Serialize};
 
-use rust_companion::{channel, ensure_companion, get_path, Response, Sender, Task};
+use companion::{channel, socket_path, Response, Sender, Task};
 
 fn main() {
-    dotenv::dotenv().ok();
-
-    let path = get_path();
-
-    ensure_companion(&path).unwrap();
+    let path = socket_path();
 
     if path.exists() {
-        let sender = Sender::<Task>::connect(&path).unwrap();
+        let sender = match Sender::<Task>::connect(&path) {
+            Ok(s) => s,
+            Err(_) => {
+                // restart from companion crash
+                fs::remove_file(&path).ok();
+                panic!("Some wrong with rust-companion")
+            }
+        };
 
         let (tx, rx) = channel::<Response>().unwrap();
 
-        sender.send(Task::Sum(vec![23, 42], tx)).unwrap();
+        sender.send(Task::Get("key".into(), tx)).unwrap();
         println!("result: {:?}", rx.recv().unwrap());
 
         let (tx, rx) = channel().unwrap();
-        sender.send(Task::Sum((0..10).collect(), tx)).unwrap();
+        sender
+            .send(Task::Set("key".into(), "data".into(), tx))
+            .unwrap();
         println!("result: {:?}", rx.recv().unwrap());
 
-        sender.send(Task::Shutdown).unwrap();
+        let (tx, rx) = channel().unwrap();
+        sender.send(Task::List(tx)).unwrap();
+        println!("result: {:?}", rx.recv().unwrap());
+
+        let (tx, rx) = channel().unwrap();
+        sender.send(Task::Get("key".into(), tx)).unwrap();
+        println!("result: {:?}", rx.recv().unwrap());
+
+        // sender.send(Task::Shutdown).unwrap();
     } else {
         panic!("rust-companion cant start");
     }
