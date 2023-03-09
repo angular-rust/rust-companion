@@ -1,44 +1,22 @@
 #![allow(unused_imports)]
-use std::{fs, time::Duration};
+use std::{fs, net::UdpSocket, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
-use companion::{channel, socket_path, Response, Sender, Task};
+use companion::{companion_addr, Response, Task};
 
 fn main() {
-    let path = socket_path();
+    let addr = companion_addr();
 
-    if path.exists() {
-        let sender = match Sender::<Task>::connect(&path) {
-            Ok(s) => s,
-            Err(_) => {
-                // restart from companion crash
-                fs::remove_file(&path).ok();
-                panic!("Some wrong with rust-companion")
-            }
-        };
+    let socket = UdpSocket::bind("[::]:0").unwrap();
+    socket.connect(addr).unwrap();
 
-        let (tx, rx) = channel::<Response>().unwrap();
+    let mut buf = [0; 65507];
 
-        sender.send(Task::Get("key".into(), tx)).unwrap();
-        println!("result: {:?}", rx.recv().unwrap());
+    socket.send(&Task::List.as_bytes()).unwrap();
 
-        let (tx, rx) = channel().unwrap();
-        sender
-            .send(Task::Set("key".into(), "data".into(), tx))
-            .unwrap();
-        println!("result: {:?}", rx.recv().unwrap());
+    let (len, _src) = socket.recv_from(&mut buf).unwrap();
+    let resp = Response::from(&buf[..len]);
 
-        let (tx, rx) = channel().unwrap();
-        sender.send(Task::List(tx)).unwrap();
-        println!("result: {:?}", rx.recv().unwrap());
-
-        let (tx, rx) = channel().unwrap();
-        sender.send(Task::Get("key".into(), tx)).unwrap();
-        println!("result: {:?}", rx.recv().unwrap());
-
-        // sender.send(Task::Shutdown).unwrap();
-    } else {
-        panic!("rust-companion cant start");
-    }
+    println!("{resp:?}")
 }

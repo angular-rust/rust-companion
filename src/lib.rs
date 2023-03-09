@@ -1,11 +1,16 @@
-//! This crate implements a minimal abstraction over UNIX domain sockets for
+#![allow(unused_imports)]
+#![allow(unreachable_code)]
+#![allow(unused_variables)]
+//! This crate implements a minimal abstraction over Udp/UNIX domain sockets for
 //! the purpose of IPC.  It lets you send both file handles and rust objects
 //! between processes.
 //!
 //! ```
 //! fn main() {
 //!     match companion::bootstrap() {
-//!         Ok(val) => println!("launched"),
+//!         Ok(lock) => {
+//!             println!("cargo:rerun-if-changed={:?}", lock);
+//!         },
 //!         Err(_) => println!("already launched"),
 //!     }
 //! }
@@ -13,6 +18,7 @@
 use std::{
     collections::HashMap,
     env, fs,
+    net::UdpSocket,
     os::unix::{
         io::{FromRawFd, IntoRawFd},
         net::UnixListener,
@@ -30,15 +36,6 @@ use log::*;
 use syslog::{BasicLogger, Facility, Formatter3164};
 
 use serde::{Deserialize, Serialize};
-
-mod raw_channel;
-pub use self::raw_channel::*;
-
-mod serialize;
-pub use self::serialize::*;
-
-mod typed_channel;
-pub use self::typed_channel::*;
 
 pub(crate) const ENV_VAR: &str = "RUST_COMPANION";
 pub(crate) const PROGRAM_NAME: &str = "rust-companion";
@@ -68,25 +65,44 @@ pub enum Response {
     NotFound,
 }
 
+impl Response {
+    pub fn as_bytes(&self) -> Vec<u8> {
+        bincode::serialize(&self).unwrap()
+    }
+}
+
+impl From<&[u8]> for Response {
+    fn from(bytes: &[u8]) -> Self {
+        bincode::deserialize(bytes).unwrap()
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
-pub enum Task {
+pub enum Task<'a> {
     // Get data by name
-    Get(String, Sender<Response>),
+    Get(&'a str),
     // Store data by name
-    Set(String, String, Sender<Response>),
+    Set(&'a str, &'a str),
     // List stored names
-    List(Sender<Response>),
-    Sum(Vec<i64>, Sender<Response>),
+    List,
+    Sum(Vec<i64>),
     Shutdown,
 }
 
-pub fn socket_path() -> PathBuf {
-    if let Ok(path) = env::var(ENV_VAR) {
-        path.into()
+impl<'a> Task<'a> {
+    pub fn as_bytes(&self) -> Vec<u8> {
+        bincode::serialize(&self).unwrap()
+    }
+}
+
+pub fn companion_addr() -> String {
+    if let Ok(addr) = env::var(ENV_VAR) {
+        addr
     } else {
-        let mut dir = std::env::temp_dir();
-        dir.push(&format!("{}.sock", PROGRAM_NAME));
-        dir
+        // let mut dir = std::env::temp_dir();
+        // dir.push(&format!("{}.sock", PROGRAM_NAME));
+        // dir
+        "[::]:2000".into()
     }
 }
 
@@ -131,7 +147,7 @@ where
     false
 }
 
-fn launch<P>(path: P)
+pub fn launch<P>(path: P)
 where
     P: AsRef<Path>,
 {
@@ -142,66 +158,82 @@ where
 
     fs::write(path, pid.to_string()).unwrap();
 
-    let socket_path = socket_path();
+    let socket_path = companion_addr();
 
     let mut storage: HashMap<String, String> = HashMap::new();
 
-    // println!("{:?}", socket_path);
+    let sock = UdpSocket::bind(&socket_path).unwrap();
 
-    fs::remove_file(&socket_path).ok();
-    let listener = UnixListener::bind(&socket_path).unwrap();
     'outer: loop {
-        let (sock, _) = listener.accept().unwrap();
-        let receiver: Receiver<Task> =
-            unsafe { RawReceiver::from_raw_fd(sock.into_raw_fd()).into() };
+        let mut buf = [0; 65507];
+        let sock = sock.try_clone().expect("Failed to clone socket");
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        loop {
-            let task = match receiver.recv() {
-                Ok(task) => task,
-                Err(_) => {
-                    // break to wait a new connection
-                    break;
-                }
-            };
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            match task {
-                Task::Get(key, tx) => {
-                    #[cfg(feature = "log")]
-                    log::info!("get {}", key);
-                    match storage.get(&key) {
-                        Some(data) => tx.send(Response::String(data.clone())).unwrap(),
-                        None => tx.send(Response::NotFound).unwrap(),
+        let (len, src) = sock.recv_from(&mut buf).unwrap();
+        let buf = &mut buf[..len];
+
+        let task: Task = bincode::deserialize(&buf).unwrap();
+        println!("{task:?}");
+        match task {
+            Task::Get(key) => {
+                #[cfg(feature = "log")]
+                log::info!("get {}", key);
+                match storage.get(key.into()) {
+                    Some(data) => {
+                        let buf = bincode::serialize(&Response::String(data.clone())).unwrap();
+                        sock.send_to(&buf, src).unwrap();
+                    }
+                    None => {
+                        let buf = bincode::serialize(&Response::NotFound).unwrap();
+                        sock.send_to(&buf, src).unwrap();
                     }
                 }
-                Task::Set(key, data, tx) => {
-                    #[cfg(feature = "log")]
-                    log::info!("set {}", key);
-                    storage.insert(key, data);
-                    tx.send(Response::Ok).unwrap();
-                }
-                Task::List(tx) => {
-                    let keys: Vec<String> = storage.keys().map(Clone::clone).collect();
-                    tx.send(Response::List(keys)).unwrap();
-                }
-                Task::Sum(_values, tx) => {
-                    #[cfg(feature = "log")]
-                    log::info!("shutdown");
-                    tx.send(Response::NotFound).unwrap();
-                }
-                Task::Shutdown => {
-                    #[cfg(feature = "log")]
-                    log::info!("shutdown");
-                    break 'outer;
-                }
+            }
+            Task::Set(key, data) => {
+                #[cfg(feature = "log")]
+                log::info!("set {}", key);
+                storage.insert(key.into(), data.into());
+                let buf = bincode::serialize(&Response::Ok).unwrap();
+                sock.send_to(&buf, src).unwrap();
+            }
+            Task::List => {
+                let keys: Vec<String> = storage.keys().map(Clone::clone).collect();
+                let buf = bincode::serialize(&Response::List(keys)).unwrap();
+                sock.send_to(&buf, src).unwrap();
+            }
+            Task::Sum(_values) => {
+                #[cfg(feature = "log")]
+                log::info!("shutdown");
+                // tx.send(Response::NotFound).unwrap();
+            }
+            Task::Shutdown => {
+                #[cfg(feature = "log")]
+                log::info!("shutdown");
+                break 'outer;
             }
         }
     }
-    fs::remove_file(&socket_path).ok();
 }
 
-pub fn bootstrap() -> std::result::Result<bool, Box<dyn std::error::Error>> {
+pub fn lockfile() -> String {
+    let mut path = PathBuf::new();
+    // from outdir
+    let source = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let mut prev = String::new();
+    for part in source.iter() {
+        if prev == "target" && (part == "debug" || part == "release") {
+            break;
+        }
+        prev = part.to_string_lossy().into();
+        path.push(part);
+    }
+    path.push("companion.lock");
+    path.as_os_str().to_string_lossy().into()
+}
+
+pub fn bootstrap() -> std::result::Result<String, Box<dyn std::error::Error>> {
     let pid_path = pid_path();
+
+    let lockfile = lockfile();
 
     if !check_started(&pid_path) {
         match env::args().nth(1) {
@@ -212,13 +244,16 @@ pub fn bootstrap() -> std::result::Result<bool, Box<dyn std::error::Error>> {
             }
             None => {
                 match env::current_exe() {
-                    Ok(exe_path) => {
-                        let _child = std::process::Command::new(&exe_path)
+                    Ok(exe) => {
+                        let _child = std::process::Command::new(&exe)
                             .arg("-d")
                             .stderr(Stdio::null())
                             .stdout(Stdio::null())
                             .spawn()?;
                         std::thread::sleep(Duration::from_micros(50));
+                        // write lock file
+                        let exe = exe.as_os_str().to_string_lossy().to_string();
+                        std::fs::write(&lockfile, format!("{exe}")).unwrap();
                     }
                     Err(e) => println!("failed to get current exe path: {e}"),
                 };
@@ -226,5 +261,5 @@ pub fn bootstrap() -> std::result::Result<bool, Box<dyn std::error::Error>> {
         }
     }
 
-    Ok(true)
+    Ok(lockfile)
 }
