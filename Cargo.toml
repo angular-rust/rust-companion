@@ -1,6 +1,6 @@
 [package]
 name = "rust-companion"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Dudochkin Victor <dudockin.victor@gmail.com>"]
 license = "MPL-2.0"

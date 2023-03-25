@@ -5,16 +5,6 @@
 //! the purpose of IPC.  It lets you send both file handles and rust objects
 //! between processes.
 //!
-//! ```
-//! fn main() {
-//!     match companion::bootstrap() {
-//!         Ok(lock) => {
-//!             println!("cargo:rerun-if-changed={:?}", lock);
-//!         },
-//!         Err(_) => println!("already launched"),
-//!     }
-//! }
-//! ```
 use std::{
     collections::HashMap,
     env, fs,
@@ -116,33 +106,30 @@ fn check_started<P>(path: P) -> bool
 where
     P: AsRef<Path>,
 {
-    match fs::read_to_string(&path) {
-        Ok(pids) => {
-            // println!("pids: {pids}");
-            let sys = sysinfo::System::new_all();
-            let processes = sys.processes();
-            let pids: Vec<u32> = pids.lines().filter_map(|s| s.parse::<u32>().ok()).collect();
-            let mut started = false;
-            let mut new_pids = vec![];
-            for pid in pids.iter() {
-                if processes.contains_key(&Pid::from_u32(*pid)) {
-                    started = true;
-                    new_pids.push(*pid);
-                }
-            }
-
-            if started {
-                let contents = new_pids
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<String>>()
-                    .join("\n");
-
-                fs::write(&path, contents).unwrap();
-                return true;
+    if let Ok(pids) = fs::read_to_string(&path) {
+        // println!("pids: {pids}");
+        let sys = sysinfo::System::new_all();
+        let processes = sys.processes();
+        let pids: Vec<u32> = pids.lines().filter_map(|s| s.parse::<u32>().ok()).collect();
+        let mut started = false;
+        let mut new_pids = vec![];
+        for pid in pids.iter() {
+            if processes.contains_key(&Pid::from_u32(*pid)) {
+                started = true;
+                new_pids.push(*pid);
             }
         }
-        Err(_) => {}
+
+        if started {
+            let contents = new_pids
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<String>>()
+                .join("\n");
+
+            fs::write(&path, contents).unwrap();
+            return true;
+        }
     }
     false
 }
@@ -171,13 +158,13 @@ where
         let (len, src) = sock.recv_from(&mut buf).unwrap();
         let buf = &mut buf[..len];
 
-        let task: Task = bincode::deserialize(&buf).unwrap();
+        let task: Task = bincode::deserialize(buf).unwrap();
         println!("{task:?}");
         match task {
             Task::Get(key) => {
                 #[cfg(feature = "log")]
                 log::info!("get {}", key);
-                match storage.get(key.into()) {
+                match storage.get(key) {
                     Some(data) => {
                         let buf = bincode::serialize(&Response::String(data.clone())).unwrap();
                         sock.send_to(&buf, src).unwrap();
@@ -253,7 +240,7 @@ pub fn bootstrap() -> std::result::Result<String, Box<dyn std::error::Error>> {
                         std::thread::sleep(Duration::from_micros(50));
                         // write lock file
                         let exe = exe.as_os_str().to_string_lossy().to_string();
-                        std::fs::write(&lockfile, format!("{exe}")).unwrap();
+                        let _ = std::fs::write(&lockfile, &exe);
                     }
                     Err(e) => println!("failed to get current exe path: {e}"),
                 };
